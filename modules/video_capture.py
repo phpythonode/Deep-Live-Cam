@@ -34,7 +34,7 @@ class VideoCapturer:
                     f"Invalid device index {device_index}. Available devices: {len(devices)}"
                 )
 
-    def start(self, width: int = 960, height: int = 540, fps: int = 60) -> bool:
+    def start(self, width: int = 1280, height: int = 720, fps: int = 60) -> bool:
         """Initialize and start video capture"""
         try:
             if platform.system() == "Windows":

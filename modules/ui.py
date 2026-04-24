@@ -72,10 +72,10 @@ ROOT_HEIGHT = 800
 ROOT_WIDTH = 600
 
 PREVIEW = None
-PREVIEW_MAX_HEIGHT = 700
-PREVIEW_MAX_WIDTH = 1200
-PREVIEW_DEFAULT_WIDTH = 640
-PREVIEW_DEFAULT_HEIGHT = 360
+PREVIEW_MAX_HEIGHT = 900
+PREVIEW_MAX_WIDTH = 1600
+PREVIEW_DEFAULT_WIDTH = 1280
+PREVIEW_DEFAULT_HEIGHT = 720
 
 POPUP_WIDTH = 750
 POPUP_HEIGHT = 810
@@ -1140,14 +1140,22 @@ def _processing_thread_func(capture_queue, processed_queue, stop_event,
                 source_image = get_one_face(cv2.imread(modules.globals.source_path))
 
             # Run detection every det_interval frames (~80ms).
-            # Use fast detection (det-only, no landmark/recognition) for live mode.
+            # Use full detection when mouth_mask is enabled (requires landmark_2d_106).
+            # Use fast detection otherwise for live mode performance.
             det_count += 1
             if det_count % det_interval == 0:
+                need_landmarks = getattr(modules.globals, "mouth_mask", False)
                 if modules.globals.many_faces:
                     cached_target_face = None
-                    cached_many_faces = detect_many_faces_fast(temp_frame)
+                    if need_landmarks:
+                        cached_many_faces = get_many_faces(temp_frame)
+                    else:
+                        cached_many_faces = detect_many_faces_fast(temp_frame)
                 else:
-                    cached_target_face = detect_one_face_fast(temp_frame)
+                    if need_landmarks:
+                        cached_target_face = get_one_face(temp_frame)
+                    else:
+                        cached_target_face = detect_one_face_fast(temp_frame)
                     cached_many_faces = None
 
             # Build face list for enhancers from cached detection
