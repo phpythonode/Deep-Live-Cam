@@ -356,16 +356,13 @@ def _build_mouth_occlusion_weight(
     """Build a per-pixel swap-weight map (float32, same size as the paste crop).
 
     Outside the mouth+chin bbox: weight = 1.0  (always show swap)
-    Inside  the mouth+chin bbox: weight = 0.0 where a hand is detected,
-                                           1.0 where the face is clear.
+    Inside  the mouth+chin bbox: weight = 0.0 where occlusion detected,
+                                           1.0 where face is clear.
 
-    Detection logic (applied only inside the small mouth region):
-      1. Pixel-level diff between original frame and swapped result.
-         Large diff  → something is in front of the face (hand).
-      2. Skin-tone check in YCrCb to confirm it is skin (not e.g. a dark
-         object or clothing) — avoids suppressing the beard itself when
-         the swap colour is close to the source.
-      Both conditions must be true to suppress the swap.
+    Detection: if the original frame pixel differs significantly from the
+    swapped result, something is in front of the face (hand, object).
+    We skip the skin-tone check — hands and faces have similar skin tones
+    so it causes false negatives. Pure diff is more reliable.
 
     `crop_offset` = (x1p, y1p) — top-left of the paste crop in frame coords.
     """
@@ -382,41 +379,29 @@ def _build_mouth_occlusion_weight(
     ly2 = min(crop_h, by2 - oy)
 
     if lx2 <= lx1 or ly2 <= ly1:
-        return weight  # bbox outside paste crop — nothing to do
+        return weight
 
-    # Work only on the small mouth sub-crop for speed
     orig_sub = target_img[ly1:ly2, lx1:lx2]
     fake_sub = bgr_fake_warped[ly1:ly2, lx1:lx2]
 
     if orig_sub.size == 0 or fake_sub.size == 0:
         return weight
 
-    # --- Step 1: pixel difference ---
+    # Pixel-level difference — low threshold (15) catches even subtle occlusion
     diff      = cv2.absdiff(orig_sub, fake_sub)
     diff_gray = cv2.cvtColor(diff, cv2.COLOR_BGR2GRAY)
-    # Threshold: 25 catches hand pixels; normal swap colour shift is < 20
-    _, diff_thresh = cv2.threshold(diff_gray, 25, 255, cv2.THRESH_BINARY)
+    _, occ_raw = cv2.threshold(diff_gray, 15, 255, cv2.THRESH_BINARY)
 
-    # --- Step 2: skin-tone confirmation in YCrCb ---
-    orig_ycrcb = cv2.cvtColor(orig_sub, cv2.COLOR_BGR2YCrCb)
-    skin_mask  = cv2.inRange(
-        orig_ycrcb,
-        np.array([0,   130, 75],  dtype=np.uint8),
-        np.array([255, 175, 130], dtype=np.uint8),
-    )
-
-    # Occluded = large diff AND skin-toned (i.e. a hand, not clothing)
-    occ_raw = cv2.bitwise_and(diff_thresh, skin_mask)
-
-    # Morphological cleanup to remove noise
-    k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
+    # Morphological cleanup: fill holes, remove tiny noise
+    k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (9, 9))
     occ_raw = cv2.morphologyEx(occ_raw, cv2.MORPH_CLOSE, k)
-    occ_raw = cv2.morphologyEx(occ_raw, cv2.MORPH_OPEN,  k)
+    k_open = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
+    occ_raw = cv2.morphologyEx(occ_raw, cv2.MORPH_OPEN, k_open)
 
-    # Smooth edges for a natural blend
-    occ_smooth = cv2.GaussianBlur(occ_raw, (15, 15), 6).astype(np.float32) / 255.0
+    # Smooth edges for natural blending
+    occ_smooth = cv2.GaussianBlur(occ_raw, (21, 21), 8).astype(np.float32) / 255.0
 
-    # weight = 1 - occlusion  (0 = show original/hand, 1 = show swap)
+    # weight = 1 - occlusion
     weight[ly1:ly2, lx1:lx2] = 1.0 - occ_smooth
 
     return weight
@@ -555,8 +540,37 @@ def swap_face(source_face: Face, target_face: Face, temp_frame: Frame) -> Frame:
         _face_size = face_swapper.input_size[0]
         _aimg_dummy = np.empty((_face_size, _face_size, 3), dtype=np.uint8)
 
-        # Mouth/chin occlusion detection disabled for now — pass None to skip
-        _mouth_chin_bbox = None
+        # Compute mouth+chin bbox from target face landmarks for occlusion detection.
+        # Suppresses beard/mouth rendering where a hand is detected in front of the face.
+        _landmarks = getattr(target_face, 'landmark_2d_106', None)
+        if _landmarks is None:
+            try:
+                from modules.face_analyser import get_face_analyser as _get_fa
+                import insightface.utils.face_align as _fa_align
+                _fa = _get_fa()
+                _lmk_model = _fa.models.get("landmark_2d_106")
+                if _lmk_model is not None and hasattr(target_face, 'kps') and target_face.kps is not None:
+                    _crop_size = 192
+                    _M_lmk, _ = _fa_align.estimate_norm(target_face.kps, _crop_size)
+                    _face_crop = cv2.warpAffine(
+                        temp_frame, _M_lmk, (_crop_size, _crop_size),
+                        flags=cv2.INTER_LINEAR,
+                    )
+                    from insightface.app.common import Face as _IFace
+                    _tmp_face = _IFace(
+                        bbox=np.array([0, 0, _crop_size, _crop_size], dtype=np.float32),
+                        kps=target_face.kps,
+                        det_score=target_face.det_score,
+                    )
+                    _lmk_model.get(_face_crop, _tmp_face)
+                    _raw_lmk = getattr(_tmp_face, 'landmark_2d_106', None)
+                    if _raw_lmk is not None:
+                        _IM_lmk = cv2.invertAffineTransform(_M_lmk)
+                        _lmk_h = np.hstack([_raw_lmk, np.ones((_raw_lmk.shape[0], 1), dtype=np.float32)])
+                        _landmarks = (_lmk_h @ _IM_lmk.T).astype(np.float32)
+            except Exception:
+                _landmarks = None
+        _mouth_chin_bbox = _get_mouth_chin_bbox(_landmarks, temp_frame.shape) if _landmarks is not None else None
 
         swapped_frame = _fast_paste_back(temp_frame, bgr_fake, _aimg_dummy, M, mouth_chin_bbox=_mouth_chin_bbox)
 
