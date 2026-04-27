@@ -314,124 +314,18 @@ def _cuda_graph_swap_inference(blob: np.ndarray, latent: np.ndarray) -> np.ndarr
         return cg['io_binding'].get_outputs()[0].numpy()
 
 
-def _get_mouth_chin_bbox(landmarks: np.ndarray, frame_shape: tuple, expand: float = 1.4) -> Optional[tuple]:
-    """Return (x1, y1, x2, y2) bounding box covering the mouth + chin (beard) area.
-
-    Uses InsightFace 106-point landmarks:
-      - Outer mouth contour: indices 52-71
-      - Chin bottom:         indices 6-10  (lower jaw centre)
-
-    The box is expanded by `expand` factor around the centroid so it
-    comfortably covers a beard below the lower lip.
-    Returns None when landmarks are unavailable or too small.
-    """
-    if landmarks is None or landmarks.shape[0] < 106:
-        return None
-
-    # Mouth outer ring + lower jaw centre points
-    mouth_pts = landmarks[52:72].astype(np.float32)
-    chin_pts  = landmarks[6:11].astype(np.float32)
-    region    = np.vstack([mouth_pts, chin_pts])
-
-    cx, cy = region.mean(axis=0)
-    pts_exp = (region - [cx, cy]) * expand + [cx, cy]
-
-    h, w = frame_shape[:2]
-    x1 = int(np.clip(pts_exp[:, 0].min(), 0, w - 1))
-    y1 = int(np.clip(pts_exp[:, 1].min(), 0, h - 1))
-    x2 = int(np.clip(pts_exp[:, 0].max(), 0, w - 1))
-    y2 = int(np.clip(pts_exp[:, 1].max(), 0, h - 1))
-
-    if x2 - x1 < 4 or y2 - y1 < 4:
-        return None
-    return (x1, y1, x2, y2)
-
-
-def _build_mouth_occlusion_weight(
-    target_img: np.ndarray,
-    bgr_fake_warped: np.ndarray,
-    bbox: tuple,
-    crop_offset: tuple,
-) -> np.ndarray:
-    """Build a per-pixel swap-weight map (float32, same size as the paste crop).
-
-    Outside the mouth+chin bbox: weight = 1.0  (always show swap)
-    Inside  the mouth+chin bbox: weight = 0.0 where occlusion detected,
-                                           1.0 where face is clear.
-
-    Detection: if the original frame pixel differs significantly from the
-    swapped result, something is in front of the face (hand, object).
-    We skip the skin-tone check — hands and faces have similar skin tones
-    so it causes false negatives. Pure diff is more reliable.
-
-    `crop_offset` = (x1p, y1p) — top-left of the paste crop in frame coords.
-    """
-    crop_h, crop_w = bgr_fake_warped.shape[:2]
-    weight = np.ones((crop_h, crop_w), dtype=np.float32)
-
-    bx1, by1, bx2, by2 = bbox
-    ox, oy = crop_offset
-
-    # Translate bbox into crop-local coordinates
-    lx1 = max(0, bx1 - ox)
-    ly1 = max(0, by1 - oy)
-    lx2 = min(crop_w, bx2 - ox)
-    ly2 = min(crop_h, by2 - oy)
-
-    if lx2 <= lx1 or ly2 <= ly1:
-        return weight
-
-    orig_sub = target_img[ly1:ly2, lx1:lx2]
-    fake_sub = bgr_fake_warped[ly1:ly2, lx1:lx2]
-
-    if orig_sub.size == 0 or fake_sub.size == 0:
-        return weight
-
-    # Pixel-level difference — low threshold (15) catches even subtle occlusion
-    diff      = cv2.absdiff(orig_sub, fake_sub)
-    diff_gray = cv2.cvtColor(diff, cv2.COLOR_BGR2GRAY)
-    _, occ_raw = cv2.threshold(diff_gray, 15, 255, cv2.THRESH_BINARY)
-
-    # Morphological cleanup: fill holes, remove tiny noise
-    k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (9, 9))
-    occ_raw = cv2.morphologyEx(occ_raw, cv2.MORPH_CLOSE, k)
-    k_open = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
-    occ_raw = cv2.morphologyEx(occ_raw, cv2.MORPH_OPEN, k_open)
-
-    # Smooth edges for natural blending
-    occ_smooth = cv2.GaussianBlur(occ_raw, (21, 21), 8).astype(np.float32) / 255.0
-
-    # weight = 1 - occlusion
-    weight[ly1:ly2, lx1:lx2] = 1.0 - occ_smooth
-
-    return weight
-
-
 def _fast_paste_back(
     target_img: Frame,
     bgr_fake: np.ndarray,
     aimg: np.ndarray,
     M: np.ndarray,
-    mouth_chin_bbox: Optional[tuple] = None,
 ) -> Frame:
-    """Paste bgr_fake back onto target_img via the inverse affine of M.
-
-    Restricts work to the face bbox in output coordinates and warps a
-    precomputed feathered alpha template per-frame instead of running a
-    size-scaled erode+blur on the warped mask. Cost is O(crop_area) regardless
-    of how much of the frame the face occupies.
-
-    When `mouth_chin_bbox` is provided (x1,y1,x2,y2 in frame coords), an
-    occlusion check is applied *only* to that region so that a hand covering
-    the mouth/beard does not get the swapped beard painted on top of it.
-    The rest of the face is always blended normally.
-    """
+    """Paste bgr_fake back onto target_img via the inverse affine of M."""
     h, w = target_img.shape[:2]
     face_h, face_w = aimg.shape[:2]
     assert face_h == face_w, f"Expected square aligned face, got {face_h}x{face_w}"
     IM = cv2.invertAffineTransform(M)
 
-    # Bbox in output coords from the affine corners of the aligned-face square.
     corners = np.array(
         [[0, 0], [face_w, 0], [face_w, face_h], [0, face_h]], dtype=np.float32
     )
@@ -458,27 +352,14 @@ def _fast_paste_back(
 
     target_crop = target_img[y1p:y2p, x1p:x2p]
 
-    # --- Mouth/chin occlusion: only suppress swap inside the beard region ---
-    alpha_f = alpha_crop.astype(np.float32) / 255.0  # base feathered alpha
-
-    if mouth_chin_bbox is not None:
-        occ_weight = _build_mouth_occlusion_weight(
-            target_crop, bgr_fake_crop,
-            mouth_chin_bbox,
-            crop_offset=(x1p, y1p),
-        )
-        alpha_f = alpha_f * occ_weight  # suppress only where hand detected
-
-    alpha_u8 = np.clip(alpha_f * 255.0, 0, 255).astype(np.uint8)
-
     if _HAS_TORCH_CUDA:
-        mask_t  = torch.from_numpy(alpha_u8).cuda().float().mul_(1.0 / 255.0).unsqueeze(2)
+        mask_t  = torch.from_numpy(alpha_crop).cuda().float().mul_(1.0 / 255.0).unsqueeze(2)
         fake_t  = torch.from_numpy(bgr_fake_crop).float().cuda()
         tgt_t   = torch.from_numpy(target_crop).float().cuda()
         blended = (mask_t * fake_t + (1.0 - mask_t) * tgt_t).to(torch.uint8).cpu().numpy()
         target_img[y1p:y2p, x1p:x2p] = blended
     else:
-        alpha_3c  = cv2.merge([alpha_u8, alpha_u8, alpha_u8])
+        alpha_3c  = cv2.merge([alpha_crop, alpha_crop, alpha_crop])
         inv_alpha = 255 - alpha_3c
         a_fake = cv2.multiply(bgr_fake_crop, alpha_3c,  scale=1.0 / 255.0)
         a_tgt  = cv2.multiply(target_crop,   inv_alpha, scale=1.0 / 255.0)
@@ -540,39 +421,7 @@ def swap_face(source_face: Face, target_face: Face, temp_frame: Frame) -> Frame:
         _face_size = face_swapper.input_size[0]
         _aimg_dummy = np.empty((_face_size, _face_size, 3), dtype=np.uint8)
 
-        # Compute mouth+chin bbox from target face landmarks for occlusion detection.
-        # Suppresses beard/mouth rendering where a hand is detected in front of the face.
-        _landmarks = getattr(target_face, 'landmark_2d_106', None)
-        if _landmarks is None:
-            try:
-                from modules.face_analyser import get_face_analyser as _get_fa
-                import insightface.utils.face_align as _fa_align
-                _fa = _get_fa()
-                _lmk_model = _fa.models.get("landmark_2d_106")
-                if _lmk_model is not None and hasattr(target_face, 'kps') and target_face.kps is not None:
-                    _crop_size = 192
-                    _M_lmk, _ = _fa_align.estimate_norm(target_face.kps, _crop_size)
-                    _face_crop = cv2.warpAffine(
-                        temp_frame, _M_lmk, (_crop_size, _crop_size),
-                        flags=cv2.INTER_LINEAR,
-                    )
-                    from insightface.app.common import Face as _IFace
-                    _tmp_face = _IFace(
-                        bbox=np.array([0, 0, _crop_size, _crop_size], dtype=np.float32),
-                        kps=target_face.kps,
-                        det_score=target_face.det_score,
-                    )
-                    _lmk_model.get(_face_crop, _tmp_face)
-                    _raw_lmk = getattr(_tmp_face, 'landmark_2d_106', None)
-                    if _raw_lmk is not None:
-                        _IM_lmk = cv2.invertAffineTransform(_M_lmk)
-                        _lmk_h = np.hstack([_raw_lmk, np.ones((_raw_lmk.shape[0], 1), dtype=np.float32)])
-                        _landmarks = (_lmk_h @ _IM_lmk.T).astype(np.float32)
-            except Exception:
-                _landmarks = None
-        _mouth_chin_bbox = _get_mouth_chin_bbox(_landmarks, temp_frame.shape) if _landmarks is not None else None
-
-        swapped_frame = _fast_paste_back(temp_frame, bgr_fake, _aimg_dummy, M, mouth_chin_bbox=_mouth_chin_bbox)
+        swapped_frame = _fast_paste_back(temp_frame, bgr_fake, _aimg_dummy, M)
 
     except Exception as e:
         print(f"Error during face swap: {e}")
