@@ -1004,9 +1004,14 @@ def webcam_preview(root: ctk.CTk, camera_index: int):
             return
         from modules.processors.frame.face_swapper import get_face_swapper
         from modules.face_analyser import get_face_analyser
-        get_face_analyser()
-        get_face_swapper()
-        create_webcam_preview(camera_index)
+        import threading
+
+        def _preload_models():
+            get_face_analyser()
+            get_face_swapper()
+            ROOT.after(0, lambda: create_webcam_preview(camera_index))
+
+        threading.Thread(target=_preload_models, daemon=True).start()
     else:
         modules.globals.source_target_map = []
         create_source_target_popup_for_webcam(
@@ -1141,21 +1146,15 @@ def _processing_thread_func(capture_queue, processed_queue, stop_event,
 
             # Run detection every det_interval frames (~80ms).
             # Use full detection when mouth_mask is enabled (requires landmark_2d_106).
-            # Use fast detection otherwise for live mode performance.
+            # Always use full detection (including recognition) for face swap,
+            # since swap_face requires normed_embedding on the target face.
             det_count += 1
             if det_count % det_interval == 0:
-                need_landmarks = getattr(modules.globals, "mouth_mask", False)
                 if modules.globals.many_faces:
                     cached_target_face = None
-                    if need_landmarks:
-                        cached_many_faces = get_many_faces(temp_frame)
-                    else:
-                        cached_many_faces = detect_many_faces_fast(temp_frame)
+                    cached_many_faces = get_many_faces(temp_frame)
                 else:
-                    if need_landmarks:
-                        cached_target_face = get_one_face(temp_frame)
-                    else:
-                        cached_target_face = detect_one_face_fast(temp_frame)
+                    cached_target_face = get_one_face(temp_frame)
                     cached_many_faces = None
 
             # Build face list for enhancers from cached detection

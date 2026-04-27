@@ -25,6 +25,11 @@ FACE_SWAPPER = None
 THREAD_LOCK = threading.Lock()
 NAME = "DLC.FACE-SWAPPER"
 
+# Background preload state
+_preload_thread: threading.Thread = None
+_preload_done = threading.Event()
+_preload_error: Exception = None
+
 # --- START: Added for Interpolation ---
 PREVIOUS_FRAME_RESULT = None # Stores the final processed frame from the previous step
 # --- END: Added for Interpolation ---
@@ -73,77 +78,99 @@ def pre_start() -> bool:
         update_status(f"Model not found in {models_dir}. Please download inswapper_128.onnx.", NAME)
         return False
 
-    # Try to get the face swapper to ensure it loads correctly
-    if get_face_swapper() is None:
-        # Error message already printed within get_face_swapper
-        return False
-
+    # Kick off background model loading immediately so UI is not blocked
+    _start_preload()
     return True
+
+
+def _start_preload():
+    """Start loading the ONNX session in a background thread (non-blocking)."""
+    global _preload_thread
+    with THREAD_LOCK:
+        if _preload_thread is None:
+            _preload_thread = threading.Thread(target=_preload_worker, daemon=True)
+            _preload_thread.start()
+
+
+def _preload_worker():
+    """Background worker: loads the face swapper model and signals completion."""
+    global FACE_SWAPPER, _preload_error
+    try:
+        swapper = _load_face_swapper()
+        with THREAD_LOCK:
+            FACE_SWAPPER = swapper
+    except Exception as e:
+        _preload_error = e
+        print(f"{NAME}: Error loading model in background: {e}")
+    finally:
+        _preload_done.set()
+
+
+def _load_face_swapper():
+    """Internal: actually loads and returns the face swapper model."""
+    fp32_path = os.path.join(models_dir, "inswapper_128.onnx")
+    fp16_path = os.path.join(models_dir, "inswapper_128_fp16.onnx")
+    use_fp16 = _HAS_TORCH_CUDA and os.path.exists(fp16_path)
+    if use_fp16:
+        model_path = fp16_path
+    elif os.path.exists(fp32_path):
+        model_path = fp32_path
+    else:
+        raise FileNotFoundError(f"No inswapper model found in {models_dir}.")
+
+    if IS_APPLE_SILICON:
+        from modules.onnx_optimize import optimize_for_coreml
+        model_path = optimize_for_coreml(model_path)
+
+    update_status(f"Loading face swapper model from: {model_path}", NAME)
+    providers_config = []
+    for p in modules.globals.execution_providers:
+        if p == "CoreMLExecutionProvider" and IS_APPLE_SILICON:
+            providers_config.append((
+                "CoreMLExecutionProvider",
+                {
+                    "ModelFormat": "MLProgram",
+                    "MLComputeUnits": "ALL",
+                    "SpecializationStrategy": "FastPrediction",
+                    "AllowLowPrecisionAccumulationOnGPU": 1,
+                    "EnableOnSubgraphs": 1,
+                }
+            ))
+        elif p == "CUDAExecutionProvider":
+            providers_config.append(p)
+        else:
+            providers_config.append(p)
+
+    swapper = insightface.model_zoo.get_model(model_path, providers=providers_config)
+    if _HAS_TORCH_CUDA and any(
+        p == "CUDAExecutionProvider" or
+        (isinstance(p, tuple) and p[0] == "CUDAExecutionProvider")
+        for p in providers_config
+    ):
+        _init_cuda_graph_session(model_path, swapper)
+    update_status("Face swapper model loaded successfully.", NAME)
+    return swapper
 
 
 def get_face_swapper() -> Any:
     global FACE_SWAPPER
 
-    with THREAD_LOCK:
-        if FACE_SWAPPER is None:
-            # Prefer FP16 on GPUs with Tensor Cores (Turing+) — half the
-            # memory bandwidth, faster inference.  Fall back to FP32 for
-            # older GPUs (e.g. GTX 16xx) where FP16 can produce NaN.
-            fp32_path = os.path.join(models_dir, "inswapper_128.onnx")
-            fp16_path = os.path.join(models_dir, "inswapper_128_fp16.onnx")
-            use_fp16 = _HAS_TORCH_CUDA and os.path.exists(fp16_path)
-            if use_fp16:
-                model_path = fp16_path
-            elif os.path.exists(fp32_path):
-                model_path = fp32_path
-            else:
-                update_status(f"No inswapper model found in {models_dir}.", NAME)
-                return None
-            # On Apple Silicon, rewrite Pad(reflect) → Slice+Concat so
-            # CoreML can run the entire model in a single partition on
-            # the Neural Engine instead of bouncing between CPU and ANE.
-            if IS_APPLE_SILICON:
-                from modules.onnx_optimize import optimize_for_coreml
-                model_path = optimize_for_coreml(model_path)
+    # Fast path: already loaded
+    if FACE_SWAPPER is not None:
+        return FACE_SWAPPER
 
-            update_status(f"Loading face swapper model from: {model_path}", NAME)
-            try:
-                providers_config = []
-                for p in modules.globals.execution_providers:
-                    if p == "CoreMLExecutionProvider" and IS_APPLE_SILICON:
-                        # Enhanced CoreML configuration for M1-M5
-                        providers_config.append((
-                            "CoreMLExecutionProvider",
-                            {
-                                "ModelFormat": "MLProgram",
-                                "MLComputeUnits": "ALL",  # Use Neural Engine + GPU + CPU
-                                "SpecializationStrategy": "FastPrediction",
-                                "AllowLowPrecisionAccumulationOnGPU": 1,
-                                "EnableOnSubgraphs": 1,
-                            }
-                        ))
-                    elif p == "CUDAExecutionProvider":
-                        # Use bare provider — ONNX Runtime defaults are
-                        # fastest on modern GPUs (Blackwell/sm_120).
-                        providers_config.append(p)
-                    else:
-                        providers_config.append(p)
-                FACE_SWAPPER = insightface.model_zoo.get_model(
-                    model_path,
-                    providers=providers_config,
-                )
-                # Set up CUDA graph session for faster inference
-                if _HAS_TORCH_CUDA and any(
-                    p == "CUDAExecutionProvider" or
-                    (isinstance(p, tuple) and p[0] == "CUDAExecutionProvider")
-                    for p in providers_config
-                ):
-                    _init_cuda_graph_session(model_path, FACE_SWAPPER)
-                update_status("Face swapper model loaded successfully.", NAME)
-            except Exception as e:
-                update_status(f"Error loading face swapper model: {e}", NAME)
-                FACE_SWAPPER = None
-                return None
+    # Ensure background load has started
+    _start_preload()
+
+    # Wait for background load, showing status so UI doesn't appear frozen
+    if not _preload_done.is_set():
+        update_status("Loading face swapper model (first run may take 1-2 min for CoreML compilation)...", NAME)
+        _preload_done.wait()
+
+    if _preload_error is not None:
+        update_status(f"Error loading face swapper model: {_preload_error}", NAME)
+        return None
+
     return FACE_SWAPPER
 
 
@@ -287,19 +314,135 @@ def _cuda_graph_swap_inference(blob: np.ndarray, latent: np.ndarray) -> np.ndarr
         return cg['io_binding'].get_outputs()[0].numpy()
 
 
-def _fast_paste_back(target_img: Frame, bgr_fake: np.ndarray, aimg: np.ndarray, M: np.ndarray) -> Frame:
+def _get_mouth_chin_bbox(landmarks: np.ndarray, frame_shape: tuple, expand: float = 1.4) -> Optional[tuple]:
+    """Return (x1, y1, x2, y2) bounding box covering the mouth + chin (beard) area.
+
+    Uses InsightFace 106-point landmarks:
+      - Outer mouth contour: indices 52-71
+      - Chin bottom:         indices 6-10  (lower jaw centre)
+
+    The box is expanded by `expand` factor around the centroid so it
+    comfortably covers a beard below the lower lip.
+    Returns None when landmarks are unavailable or too small.
+    """
+    if landmarks is None or landmarks.shape[0] < 106:
+        return None
+
+    # Mouth outer ring + lower jaw centre points
+    mouth_pts = landmarks[52:72].astype(np.float32)
+    chin_pts  = landmarks[6:11].astype(np.float32)
+    region    = np.vstack([mouth_pts, chin_pts])
+
+    cx, cy = region.mean(axis=0)
+    pts_exp = (region - [cx, cy]) * expand + [cx, cy]
+
+    h, w = frame_shape[:2]
+    x1 = int(np.clip(pts_exp[:, 0].min(), 0, w - 1))
+    y1 = int(np.clip(pts_exp[:, 1].min(), 0, h - 1))
+    x2 = int(np.clip(pts_exp[:, 0].max(), 0, w - 1))
+    y2 = int(np.clip(pts_exp[:, 1].max(), 0, h - 1))
+
+    if x2 - x1 < 4 or y2 - y1 < 4:
+        return None
+    return (x1, y1, x2, y2)
+
+
+def _build_mouth_occlusion_weight(
+    target_img: np.ndarray,
+    bgr_fake_warped: np.ndarray,
+    bbox: tuple,
+    crop_offset: tuple,
+) -> np.ndarray:
+    """Build a per-pixel swap-weight map (float32, same size as the paste crop).
+
+    Outside the mouth+chin bbox: weight = 1.0  (always show swap)
+    Inside  the mouth+chin bbox: weight = 0.0 where a hand is detected,
+                                           1.0 where the face is clear.
+
+    Detection logic (applied only inside the small mouth region):
+      1. Pixel-level diff between original frame and swapped result.
+         Large diff  → something is in front of the face (hand).
+      2. Skin-tone check in YCrCb to confirm it is skin (not e.g. a dark
+         object or clothing) — avoids suppressing the beard itself when
+         the swap colour is close to the source.
+      Both conditions must be true to suppress the swap.
+
+    `crop_offset` = (x1p, y1p) — top-left of the paste crop in frame coords.
+    """
+    crop_h, crop_w = bgr_fake_warped.shape[:2]
+    weight = np.ones((crop_h, crop_w), dtype=np.float32)
+
+    bx1, by1, bx2, by2 = bbox
+    ox, oy = crop_offset
+
+    # Translate bbox into crop-local coordinates
+    lx1 = max(0, bx1 - ox)
+    ly1 = max(0, by1 - oy)
+    lx2 = min(crop_w, bx2 - ox)
+    ly2 = min(crop_h, by2 - oy)
+
+    if lx2 <= lx1 or ly2 <= ly1:
+        return weight  # bbox outside paste crop — nothing to do
+
+    # Work only on the small mouth sub-crop for speed
+    orig_sub = target_img[ly1:ly2, lx1:lx2]
+    fake_sub = bgr_fake_warped[ly1:ly2, lx1:lx2]
+
+    if orig_sub.size == 0 or fake_sub.size == 0:
+        return weight
+
+    # --- Step 1: pixel difference ---
+    diff      = cv2.absdiff(orig_sub, fake_sub)
+    diff_gray = cv2.cvtColor(diff, cv2.COLOR_BGR2GRAY)
+    # Threshold: 25 catches hand pixels; normal swap colour shift is < 20
+    _, diff_thresh = cv2.threshold(diff_gray, 25, 255, cv2.THRESH_BINARY)
+
+    # --- Step 2: skin-tone confirmation in YCrCb ---
+    orig_ycrcb = cv2.cvtColor(orig_sub, cv2.COLOR_BGR2YCrCb)
+    skin_mask  = cv2.inRange(
+        orig_ycrcb,
+        np.array([0,   130, 75],  dtype=np.uint8),
+        np.array([255, 175, 130], dtype=np.uint8),
+    )
+
+    # Occluded = large diff AND skin-toned (i.e. a hand, not clothing)
+    occ_raw = cv2.bitwise_and(diff_thresh, skin_mask)
+
+    # Morphological cleanup to remove noise
+    k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
+    occ_raw = cv2.morphologyEx(occ_raw, cv2.MORPH_CLOSE, k)
+    occ_raw = cv2.morphologyEx(occ_raw, cv2.MORPH_OPEN,  k)
+
+    # Smooth edges for a natural blend
+    occ_smooth = cv2.GaussianBlur(occ_raw, (15, 15), 6).astype(np.float32) / 255.0
+
+    # weight = 1 - occlusion  (0 = show original/hand, 1 = show swap)
+    weight[ly1:ly2, lx1:lx2] = 1.0 - occ_smooth
+
+    return weight
+
+
+def _fast_paste_back(
+    target_img: Frame,
+    bgr_fake: np.ndarray,
+    aimg: np.ndarray,
+    M: np.ndarray,
+    mouth_chin_bbox: Optional[tuple] = None,
+) -> Frame:
     """Paste bgr_fake back onto target_img via the inverse affine of M.
 
     Restricts work to the face bbox in output coordinates and warps a
     precomputed feathered alpha template per-frame instead of running a
     size-scaled erode+blur on the warped mask. Cost is O(crop_area) regardless
     of how much of the frame the face occupies.
+
+    When `mouth_chin_bbox` is provided (x1,y1,x2,y2 in frame coords), an
+    occlusion check is applied *only* to that region so that a hand covering
+    the mouth/beard does not get the swapped beard painted on top of it.
+    The rest of the face is always blended normally.
     """
     h, w = target_img.shape[:2]
     face_h, face_w = aimg.shape[:2]
-    # inswapper's aligned-face space is square (128x128). _get_soft_alpha
-    # caches a single NxN template keyed by N, so fail loudly if that ever
-    # stops being true rather than silently mis-warping the alpha mask.
     assert face_h == face_w, f"Expected square aligned face, got {face_h}x{face_w}"
     IM = cv2.invertAffineTransform(M)
 
@@ -315,7 +458,6 @@ def _fast_paste_back(target_img: Frame, bgr_fake: np.ndarray, aimg: np.ndarray, 
     if x1 >= x2 or y1 >= y2:
         return target_img
 
-    # Small interpolation margin only — the feather is baked into the template.
     pad = 2
     y1p, y2p = max(0, y1 - pad), min(h, y2 + pad + 1)
     x1p, x2p = max(0, x1 - pad), min(w, x2 + pad + 1)
@@ -327,24 +469,34 @@ def _fast_paste_back(target_img: Frame, bgr_fake: np.ndarray, aimg: np.ndarray, 
 
     soft_alpha = _get_soft_alpha(face_h)
     bgr_fake_crop = cv2.warpAffine(bgr_fake, IM_crop, (crop_w, crop_h), borderMode=cv2.BORDER_REPLICATE)
-    alpha_crop = cv2.warpAffine(soft_alpha, IM_crop, (crop_w, crop_h), borderValue=0)
+    alpha_crop    = cv2.warpAffine(soft_alpha, IM_crop, (crop_w, crop_h), borderValue=0)
 
     target_crop = target_img[y1p:y2p, x1p:x2p]
 
+    # --- Mouth/chin occlusion: only suppress swap inside the beard region ---
+    alpha_f = alpha_crop.astype(np.float32) / 255.0  # base feathered alpha
+
+    if mouth_chin_bbox is not None:
+        occ_weight = _build_mouth_occlusion_weight(
+            target_crop, bgr_fake_crop,
+            mouth_chin_bbox,
+            crop_offset=(x1p, y1p),
+        )
+        alpha_f = alpha_f * occ_weight  # suppress only where hand detected
+
+    alpha_u8 = np.clip(alpha_f * 255.0, 0, 255).astype(np.uint8)
+
     if _HAS_TORCH_CUDA:
-        # Scale alpha to [0, 1] on device — cheaper to upload uint8 than float.
-        mask_t = torch.from_numpy(alpha_crop).cuda().float().mul_(1.0 / 255.0).unsqueeze(2)
-        fake_t = torch.from_numpy(bgr_fake_crop).float().cuda()
-        tgt_t = torch.from_numpy(target_crop).float().cuda()
+        mask_t  = torch.from_numpy(alpha_u8).cuda().float().mul_(1.0 / 255.0).unsqueeze(2)
+        fake_t  = torch.from_numpy(bgr_fake_crop).float().cuda()
+        tgt_t   = torch.from_numpy(target_crop).float().cuda()
         blended = (mask_t * fake_t + (1.0 - mask_t) * tgt_t).to(torch.uint8).cpu().numpy()
         target_img[y1p:y2p, x1p:x2p] = blended
     else:
-        # Fused uint8 blend via cv2 SIMD — no float32 round-trip.
-        # Measured ~7-8× faster than the old numpy float32 path on a 1000×1000 crop.
-        alpha_3c = cv2.merge([alpha_crop, alpha_crop, alpha_crop])
+        alpha_3c  = cv2.merge([alpha_u8, alpha_u8, alpha_u8])
         inv_alpha = 255 - alpha_3c
-        a_fake = cv2.multiply(bgr_fake_crop, alpha_3c, scale=1.0 / 255.0)
-        a_tgt = cv2.multiply(target_crop, inv_alpha, scale=1.0 / 255.0)
+        a_fake = cv2.multiply(bgr_fake_crop, alpha_3c,  scale=1.0 / 255.0)
+        a_tgt  = cv2.multiply(target_crop,   inv_alpha, scale=1.0 / 255.0)
         target_img[y1p:y2p, x1p:x2p] = cv2.add(a_fake, a_tgt)
 
     return target_img
@@ -403,7 +555,10 @@ def swap_face(source_face: Face, target_face: Face, temp_frame: Frame) -> Frame:
         _face_size = face_swapper.input_size[0]
         _aimg_dummy = np.empty((_face_size, _face_size, 3), dtype=np.uint8)
 
-        swapped_frame = _fast_paste_back(temp_frame, bgr_fake, _aimg_dummy, M)
+        # Mouth/chin occlusion detection disabled for now — pass None to skip
+        _mouth_chin_bbox = None
+
+        swapped_frame = _fast_paste_back(temp_frame, bgr_fake, _aimg_dummy, M, mouth_chin_bbox=_mouth_chin_bbox)
 
     except Exception as e:
         print(f"Error during face swap: {e}")

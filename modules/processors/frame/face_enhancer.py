@@ -19,9 +19,14 @@ from modules.utilities import (
 )
 
 FACE_ENHANCER = None
-THREAD_SEMAPHORE = threading.Semaphore()
+THREAD_SEMAPHORE = threading.Semaphore(4)  # allow up to 4 concurrent inference calls
 THREAD_LOCK = threading.Lock()
 NAME = "DLC.FACE-ENHANCER"
+
+# Background preload state
+_preload_thread: threading.Thread = None
+_preload_done = threading.Event()
+_preload_error: Exception = None
 
 abs_dir = os.path.dirname(os.path.abspath(__file__))
 models_dir = os.path.join(
@@ -51,7 +56,40 @@ def pre_check() -> bool:
             NAME,
         )
         return False
+    # Kick off background model loading immediately so it's ready when needed
+    _start_preload()
     return True
+
+
+def _start_preload():
+    """Start loading the ONNX session in a background thread (non-blocking)."""
+    global _preload_thread
+    with THREAD_LOCK:
+        if _preload_thread is None:
+            _preload_thread = threading.Thread(target=_preload_worker, daemon=True)
+            _preload_thread.start()
+
+
+def _preload_worker():
+    """Background worker: loads the ONNX session and signals completion."""
+    global FACE_ENHANCER, _preload_error
+    model_path = os.path.join(models_dir, "gfpgan-1024.onnx")
+    try:
+        from modules.processors.frame._onnx_enhancer import create_onnx_session
+        session = create_onnx_session(model_path)
+        with THREAD_LOCK:
+            FACE_ENHANCER = session
+        input_info = session.get_inputs()[0]
+        output_info = session.get_outputs()[0]
+        print(f"{NAME}: GFPGAN ONNX model loaded successfully.")
+        print(f"{NAME}: Input: {input_info.name}, shape: {input_info.shape}, type: {input_info.type}")
+        print(f"{NAME}: Output: {output_info.name}, shape: {output_info.shape}, type: {output_info.type}")
+        print(f"{NAME}: Active providers: {session.get_providers()}")
+    except Exception as e:
+        _preload_error = e
+        print(f"{NAME}: Error loading GFPGAN ONNX model: {e}")
+    finally:
+        _preload_done.set()
 
 
 def pre_start() -> bool:
@@ -65,54 +103,28 @@ def pre_start() -> bool:
 
 def get_face_enhancer() -> onnxruntime.InferenceSession:
     """
-    Initializes and returns the GFPGAN ONNX Runtime inference session,
-    using the execution providers configured in modules.globals.
+    Returns the GFPGAN ONNX Runtime inference session.
+    If still loading in background, waits for it to finish (with status update).
     """
     global FACE_ENHANCER
 
-    with THREAD_LOCK:
-        if FACE_ENHANCER is None:
-            model_path = os.path.join(models_dir, "gfpgan-1024.onnx")
+    # Fast path: already loaded
+    if FACE_ENHANCER is not None:
+        return FACE_ENHANCER
 
-            if not os.path.exists(model_path):
-                raise FileNotFoundError(
-                    f"{NAME}: Model not found at {model_path}"
-                )
+    # Ensure background load has started
+    _start_preload()
 
-            try:
-                from modules.processors.frame._onnx_enhancer import (
-                    create_onnx_session,
-                )
+    # Wait for background load, showing a status message so UI doesn't appear frozen
+    if not _preload_done.is_set():
+        update_status("Loading GFPGAN model (first run may take 1-2 min for CoreML compilation)...", NAME)
+        _preload_done.wait()
 
-                FACE_ENHANCER = create_onnx_session(model_path)
-
-                input_info = FACE_ENHANCER.get_inputs()[0]
-                output_info = FACE_ENHANCER.get_outputs()[0]
-                active_providers = FACE_ENHANCER.get_providers()
-                print(
-                    f"{NAME}: GFPGAN ONNX model loaded successfully."
-                )
-                print(
-                    f"{NAME}: Input: {input_info.name}, "
-                    f"shape: {input_info.shape}, type: {input_info.type}"
-                )
-                print(
-                    f"{NAME}: Output: {output_info.name}, "
-                    f"shape: {output_info.shape}, type: {output_info.type}"
-                )
-                print(f"{NAME}: Active providers: {active_providers}")
-
-            except Exception as e:
-                print(f"{NAME}: Error loading GFPGAN ONNX model: {e}")
-                FACE_ENHANCER = None
-                raise RuntimeError(
-                    f"{NAME}: Failed to load GFPGAN ONNX model: {e}"
-                )
+    if _preload_error is not None:
+        raise RuntimeError(f"{NAME}: Failed to load GFPGAN ONNX model: {_preload_error}")
 
     if FACE_ENHANCER is None:
-        raise RuntimeError(
-            f"{NAME}: Failed to initialize GFPGAN ONNX session. Check logs."
-        )
+        raise RuntimeError(f"{NAME}: Failed to initialize GFPGAN ONNX session. Check logs.")
 
     return FACE_ENHANCER
 

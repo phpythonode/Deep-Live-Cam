@@ -52,40 +52,65 @@ def _optimize_det_model(fa: Any, providers) -> None:
     if not IS_APPLE_SILICON:
         return
 
+    import onnxruntime
+
+    # --- Detection model (det_10g) ---
     det_model = fa.det_model
     model_path = getattr(det_model, 'model_file', None)
-    if model_path is None or not os.path.exists(model_path):
-        return
+    if model_path and os.path.exists(model_path):
+        input_shape = (1, 3, DET_SIZE[1], DET_SIZE[0])
+        optimized_path = optimize_for_coreml(model_path, input_shape=input_shape)
+        if optimized_path != model_path:
+            session_options = onnxruntime.SessionOptions()
+            session_options.graph_optimization_level = (
+                onnxruntime.GraphOptimizationLevel.ORT_ENABLE_ALL
+            )
+            # Route detection to GPU shader cores (CPUAndGPU) instead of ANE.
+            # This lets detection run concurrently with the swap model on the
+            # ANE, overlapping the two inference calls.
+            det_providers = []
+            for p in providers:
+                name = p[0] if isinstance(p, tuple) else p
+                if name == "CoreMLExecutionProvider":
+                    det_providers.append((
+                        "CoreMLExecutionProvider",
+                        {"ModelFormat": "MLProgram", "MLComputeUnits": "CPUAndGPU"},
+                    ))
+                else:
+                    det_providers.append(p)
+            det_model.session = onnxruntime.InferenceSession(
+                optimized_path, sess_options=session_options, providers=det_providers,
+            )
 
-    input_shape = (1, 3, DET_SIZE[1], DET_SIZE[0])
-    optimized_path = optimize_for_coreml(model_path, input_shape=input_shape)
-    if optimized_path == model_path:
-        return
-
-    import onnxruntime
-    session_options = onnxruntime.SessionOptions()
-    session_options.graph_optimization_level = (
-        onnxruntime.GraphOptimizationLevel.ORT_ENABLE_ALL
-    )
-
-    # Route detection to GPU shader cores (CPUAndGPU) instead of ANE.
-    # This lets detection run concurrently with the swap model on the
-    # ANE, overlapping the two inference calls.  Detection is fast
-    # enough on GPU (~4ms) and this frees ANE for the heavier swap.
-    det_providers = []
-    for p in providers:
-        name = p[0] if isinstance(p, tuple) else p
-        if name == "CoreMLExecutionProvider":
-            det_providers.append((
-                "CoreMLExecutionProvider",
-                {"ModelFormat": "MLProgram", "MLComputeUnits": "CPUAndGPU"},
-            ))
-        else:
-            det_providers.append(p)
-
-    det_model.session = onnxruntime.InferenceSession(
-        optimized_path, sess_options=session_options, providers=det_providers,
-    )
+    # --- Landmark model (2d106det) ---
+    # Pre-compile CoreML cache for the landmark model so the first live
+    # frame doesn't trigger a blocking compilation.
+    lmk_model = fa.models.get("landmark_2d_106")
+    if lmk_model is not None:
+        lmk_path = getattr(lmk_model, 'model_file', None)
+        if lmk_path and os.path.exists(lmk_path):
+            # landmark input is fixed at (1, 3, 192, 192)
+            lmk_input_shape = (1, 3, 192, 192)
+            lmk_optimized = optimize_for_coreml(lmk_path, input_shape=lmk_input_shape)
+            if lmk_optimized != lmk_path:
+                session_options = onnxruntime.SessionOptions()
+                session_options.graph_optimization_level = (
+                    onnxruntime.GraphOptimizationLevel.ORT_ENABLE_ALL
+                )
+                lmk_providers = []
+                for p in providers:
+                    name = p[0] if isinstance(p, tuple) else p
+                    if name == "CoreMLExecutionProvider":
+                        lmk_providers.append((
+                            "CoreMLExecutionProvider",
+                            {"ModelFormat": "MLProgram", "MLComputeUnits": "ALL"},
+                        ))
+                    else:
+                        lmk_providers.append(p)
+                lmk_model.session = onnxruntime.InferenceSession(
+                    lmk_optimized, sess_options=session_options, providers=lmk_providers,
+                )
+                print(f"[face_analyser] landmark model optimized for CoreML: {lmk_optimized}", flush=True)
 
 
 def _needs_landmark() -> bool:

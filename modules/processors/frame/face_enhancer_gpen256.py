@@ -24,8 +24,8 @@ from modules.processors.frame._onnx_enhancer import (
 
 NAME = "DLC.FACE-ENHANCER-GPEN256"
 INPUT_SIZE = 256
-MODEL_URL = "https://github.com/harisreedhar/Face-Upscalers-ONNX/releases/download/GPEN-BFR/GPEN-BFR-256.onnx"
-MODEL_FILE = "GPEN-BFR-256.onnx"
+MODEL_URL = "https://huggingface.co/uwg/upscaler/resolve/main/Face_Restore/FaceFusion/gpen_bfr_256.onnx"
+MODEL_FILE = "gpen_bfr_256.onnx"
 
 ENHANCER = None
 THREAD_LOCK = threading.Lock()
@@ -82,8 +82,8 @@ def enhance_face(temp_frame: Frame, face: Face) -> Frame:
         return temp_frame
 
 
-def process_frame(source_face: Face | None, temp_frame: Frame) -> Frame:
-    target_face = get_one_face(temp_frame)
+def process_frame(source_face: Face | None, temp_frame: Frame, detected_faces=None) -> Frame:
+    target_face = detected_faces[0] if detected_faces else get_one_face(temp_frame)
     if target_face is None:
         return temp_frame
     return enhance_face(temp_frame, target_face)
