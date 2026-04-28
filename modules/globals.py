@@ -57,6 +57,9 @@ face_swapper_enabled: bool = True # General toggle for the swapper processor
 opacity: float = 1.0              # Blend factor for the swapped face (0.0-1.0)
 sharpness: float = 0.0            # Sharpness enhancement for swapped face (0.0-1.0+)
 
+# Occlusion Mask Options
+use_occlusion_mask: bool = False   # Enable occlusion mask (uses xseg model to detect obstructions)
+
 # Mouth Mask Options
 mouth_mask: bool = False           # Enable mouth area masking/pasting
 show_mouth_mask_box: bool = False  # Visualize the mouth mask area (for debugging)

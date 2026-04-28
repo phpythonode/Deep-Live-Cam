@@ -1,8 +1,99 @@
 import cv2
 import numpy as np
+import os
+import threading
+from typing import Optional
 from modules.typing import Face, Frame
 import modules.globals
 from modules.gpu_processing import gpu_gaussian_blur, gpu_resize, gpu_cvt_color
+
+# --- Occlusion Mask (XSeg model) ---
+_XSEG_SESSION = None
+_XSEG_LOCK = threading.Lock()
+_XSEG_SIZE = (256, 256)
+
+def _get_xseg_session():
+    """Lazy-load the xseg ONNX session (thread-safe)."""
+    global _XSEG_SESSION
+    if _XSEG_SESSION is not None:
+        return _XSEG_SESSION
+    with _XSEG_LOCK:
+        if _XSEG_SESSION is not None:
+            return _XSEG_SESSION
+        try:
+            import onnxruntime as ort
+            # Search for xseg model: prefer local models dir, then facefusion assets
+            _root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
+            candidates = [
+                os.path.join(_root, 'models', 'xseg_1.onnx'),
+                os.path.join(_root, 'models', 'xseg_3.onnx'),
+                # Fallback: sibling facefusion project
+                os.path.join(os.path.dirname(_root), 'facefusion', '.assets', 'models', 'xseg_1.onnx'),
+                os.path.join(os.path.dirname(_root), 'facefusion', '.assets', 'models', 'xseg_3.onnx'),
+            ]
+            model_path = None
+            for c in candidates:
+                if os.path.exists(c):
+                    model_path = c
+                    break
+            if model_path is None:
+                print('[face_masking] xseg model not found. Occlusion mask disabled.')
+                return None
+            # Build providers from globals
+            providers = []
+            for p in getattr(modules.globals, 'execution_providers', ['CPUExecutionProvider']):
+                if isinstance(p, str):
+                    providers.append(p)
+                else:
+                    providers.append(p)
+            if not providers:
+                providers = ['CPUExecutionProvider']
+            _XSEG_SESSION = ort.InferenceSession(model_path, providers=providers)
+            print(f'[face_masking] xseg occlusion model loaded: {os.path.basename(model_path)}')
+        except Exception as e:
+            print(f'[face_masking] Failed to load xseg model: {e}')
+            _XSEG_SESSION = None
+    return _XSEG_SESSION
+
+
+def create_occlusion_mask(crop_frame: np.ndarray) -> np.ndarray:
+    """
+    Generate an occlusion mask for a cropped face frame using the XSeg model.
+    Returns a float32 mask [0,1] the same size as crop_frame.
+    Pixels where the face is occluded (e.g. by a hand) will be 0 (masked out).
+    """
+    session = _get_xseg_session()
+    if session is None:
+        # No model available — return all-ones (no masking)
+        return np.ones(crop_frame.shape[:2], dtype=np.float32)
+
+    try:
+        h, w = crop_frame.shape[:2]
+        resized = cv2.resize(crop_frame, _XSEG_SIZE)
+        inp = resized.astype(np.float32) / 255.0
+        inp = np.expand_dims(inp, axis=0)          # (1, 256, 256, 3)
+        inp = inp.transpose(0, 1, 2, 3)            # keep NHWC as xseg expects
+
+        raw = session.run(None, {'input': inp})[0]  # (N, 256, 256, 1) NHWC
+        # Normalise output shape to (256, 256)
+        raw = raw.squeeze()  # -> (256, 256)
+        raw = raw.clip(0, 1).astype(np.float32)
+        # Resize back to crop size
+        mask = cv2.resize(raw, (w, h))
+        # Smooth and sharpen edges (same as facefusion)
+        mask = (cv2.GaussianBlur(mask.clip(0, 1), (0, 0), 5).clip(0.5, 1) - 0.5) * 2
+        return mask.clip(0, 1).astype(np.float32)
+    except Exception as e:
+        print(f'[face_masking] occlusion mask inference error: {e}')
+        return np.ones(crop_frame.shape[:2], dtype=np.float32)
+
+
+def reset_occlusion_session():
+    """Call this if execution_providers change at runtime."""
+    global _XSEG_SESSION
+    with _XSEG_LOCK:
+        _XSEG_SESSION = None
+# --- End Occlusion Mask ---
 
 def apply_color_transfer(source, target):
     """

@@ -140,6 +140,7 @@ def save_switch_states():
         "mouth_mask": modules.globals.mouth_mask,
         "show_mouth_mask_box": modules.globals.show_mouth_mask_box,
         "mouth_mask_size": modules.globals.mouth_mask_size,
+        "use_occlusion_mask": modules.globals.use_occlusion_mask,
     }
     with open("switch_states.json", "w") as f:
         json.dump(switch_states, f)
@@ -165,6 +166,7 @@ def load_switch_states():
         # mouth_mask is driven by the slider: on if size > 0, off if 0
         modules.globals.mouth_mask = modules.globals.mouth_mask_size > 0
         modules.globals.show_mouth_mask_box = False  # always start hidden
+        modules.globals.use_occlusion_mask = switch_states.get("use_occlusion_mask", False)
     except FileNotFoundError:
         # If the file doesn't exist, use default values
         pass
@@ -344,24 +346,24 @@ def create_root(start: Callable[[], None], destroy: Callable[[], None]) -> ctk.C
     start_button = ctk.CTkButton(
         root, text=_("Start"), cursor="hand2", command=lambda: analyze_target(start, root)
     )
-    start_button.place(relx=0.15, rely=0.78, relwidth=0.2, relheight=0.04)
+    start_button.place(relx=0.15, rely=0.83, relwidth=0.2, relheight=0.04)
     ToolTip(start_button, _("Begin processing the target image/video with selected face"))
 
     stop_button = ctk.CTkButton(
         root, text=_("Destroy"), cursor="hand2", command=lambda: destroy()
     )
-    stop_button.place(relx=0.4, rely=0.78, relwidth=0.2, relheight=0.04)
+    stop_button.place(relx=0.4, rely=0.83, relwidth=0.2, relheight=0.04)
     ToolTip(stop_button, _("Stop processing and close the application"))
 
     preview_button = ctk.CTkButton(
         root, text=_("Preview"), cursor="hand2", command=lambda: toggle_preview()
     )
-    preview_button.place(relx=0.65, rely=0.78, relwidth=0.2, relheight=0.04)
+    preview_button.place(relx=0.65, rely=0.83, relwidth=0.2, relheight=0.04)
     ToolTip(preview_button, _("Show/hide a preview of the processed output"))
 
     # --- Camera Selection ---
     camera_label = ctk.CTkLabel(root, text=_("Select Camera:"))
-    camera_label.place(relx=0.1, rely=0.83, relwidth=0.2, relheight=0.03)
+    camera_label.place(relx=0.1, rely=0.89, relwidth=0.2, relheight=0.03)
 
     available_cameras = get_available_cameras()
     camera_indices, camera_names = available_cameras
@@ -380,7 +382,7 @@ def create_root(start: Callable[[], None], destroy: Callable[[], None]) -> ctk.C
             root, variable=camera_variable, values=camera_names
         )
 
-    camera_optionmenu.place(relx=0.35, rely=0.83, relwidth=0.25, relheight=0.03)
+    camera_optionmenu.place(relx=0.35, rely=0.89, relwidth=0.25, relheight=0.03)
     ToolTip(camera_optionmenu, _("Select which camera to use for live mode"))
 
     live_button = ctk.CTkButton(
@@ -401,7 +403,7 @@ def create_root(start: Callable[[], None], destroy: Callable[[], None]) -> ctk.C
             else "disabled"
         ),
     )
-    live_button.place(relx=0.65, rely=0.83, relwidth=0.2, relheight=0.03)
+    live_button.place(relx=0.65, rely=0.89, relwidth=0.2, relheight=0.03)
     ToolTip(live_button, _("Start real-time face swap using webcam"))
     # --- End Camera Selection ---
 
@@ -559,15 +561,30 @@ def create_root(start: Callable[[], None], destroy: Callable[[], None]) -> ctk.C
     mouth_mask_size_slider.bind("<ButtonRelease-1>", on_mouth_mask_slider_release)
     ToolTip(mouth_mask_size_slider, _("0 = use swapped mouth, 100 = expose original mouth to chin area"))
 
+    # 5) Occlusion Mask switch
+    occlusion_mask_value = ctk.BooleanVar(value=modules.globals.use_occlusion_mask)
+    occlusion_mask_switch = ctk.CTkSwitch(
+        root,
+        text=_("Occlusion Mask"),
+        variable=occlusion_mask_value,
+        cursor="hand2",
+        command=lambda: (
+            setattr(modules.globals, "use_occlusion_mask", occlusion_mask_value.get()),
+            save_switch_states(),
+        ),
+    )
+    occlusion_mask_switch.place(relx=0.1, rely=0.75)
+    ToolTip(occlusion_mask_switch, _("Detect obstructions (hands, objects) and keep them in front of the swapped face"))
+
     # Status and link at the bottom
     global status_label
     status_label = ctk.CTkLabel(root, text=None, justify="center")
-    status_label.place(relx=0.1, rely=0.75, relwidth=0.8)
+    status_label.place(relx=0.1, rely=0.79, relwidth=0.8)
 
     donate_label = ctk.CTkLabel(
         root, text="Deep Live Cam", justify="center", cursor="hand2"
     )
-    donate_label.place(relx=0.1, rely=0.87, relwidth=0.8)
+    donate_label.place(relx=0.1, rely=0.97, relwidth=0.8)
     donate_label.configure(
         text_color=ctk.ThemeManager.theme.get("URL").get("text_color")
     )

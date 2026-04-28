@@ -17,6 +17,7 @@ from modules.utilities import (
 )
 from modules.cluster_analysis import find_closest_centroid
 from modules.gpu_processing import gpu_gaussian_blur, gpu_sharpen, gpu_add_weighted, gpu_resize, gpu_cvt_color
+from modules.processors.frame.face_masking import create_occlusion_mask
 import os
 from collections import deque
 import time
@@ -368,7 +369,8 @@ def swap_face(source_face: Face, target_face: Face, temp_frame: Frame) -> Frame:
     opacity = getattr(modules.globals, "opacity", 1.0)
     opacity = max(0.0, min(1.0, opacity))
     mouth_mask_enabled = getattr(modules.globals, "mouth_mask", False)
-    needs_original = opacity < 1.0 or mouth_mask_enabled
+    occlusion_mask_enabled = getattr(modules.globals, "use_occlusion_mask", False)
+    needs_original = opacity < 1.0 or mouth_mask_enabled or occlusion_mask_enabled
     if needs_original:
         original_frame = temp_frame.copy()
     else:
@@ -411,6 +413,37 @@ def swap_face(source_face: Face, target_face: Face, temp_frame: Frame) -> Frame:
 
     # --- Post-swap Processing (Masking, Opacity, etc.) ---
     # Now, work with the guaranteed uint8 'swapped_frame'
+
+    # --- Occlusion Mask ---
+    # Restore occluded regions (e.g. hands covering face) from the original frame.
+    if occlusion_mask_enabled:
+        try:
+            # Warp the original frame into face-aligned crop space using M
+            _face_size_occ = face_swapper.input_size[0]
+            crop_size_occ = (_face_size_occ, _face_size_occ)
+            crop_original = cv2.warpAffine(
+                original_frame, M, crop_size_occ,
+                borderMode=cv2.BORDER_REPLICATE, flags=cv2.INTER_AREA
+            )
+            # Generate occlusion mask in crop space (float32, 0=occluded, 1=visible)
+            occ_mask = create_occlusion_mask(crop_original)  # (H, W) float32
+
+            # Warp the occlusion mask back to full-frame space
+            h_full, w_full = original_frame.shape[:2]
+            IM_occ = cv2.invertAffineTransform(M)
+            occ_mask_full = cv2.warpAffine(
+                occ_mask, IM_occ, (w_full, h_full), borderValue=0.0
+            )
+            # Expand to 3 channels for blending
+            occ_mask_3ch = occ_mask_full[:, :, np.newaxis]
+            # Blend: where mask=1 keep swapped, where mask=0 restore original
+            swapped_frame = (
+                swapped_frame.astype(np.float32) * occ_mask_3ch
+                + original_frame.astype(np.float32) * (1.0 - occ_mask_3ch)
+            ).clip(0, 255).astype(np.uint8)
+        except Exception as occ_e:
+            print(f"[occlusion_mask] error: {occ_e}")
+    # --- End Occlusion Mask ---
 
     if mouth_mask_enabled: # Check if mouth_mask is enabled
         # Create a mask for the target face
